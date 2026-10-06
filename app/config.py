@@ -219,12 +219,28 @@ class Settings(BaseSettings):
     embedding_similar_cache_ttl_hours: int = Field(default=24, ge=1)
     embedding_max_distance_default: float = Field(default=0.3, ge=0.0, le=2.0)
 
+    # ─── Matching (Phase 3) ─────────────────────────────
+    matching_llm_enabled: bool = Field(default=True)
+    matching_accept_threshold: float = Field(default=0.70, ge=0.0, le=1.0)
+    matching_borderline_threshold: float = Field(default=0.40, ge=0.0, le=1.0)
+    matching_base_cluster_distance: float = Field(default=0.20, ge=0.0, le=2.0)
+
+    destructive_admin_token: str | None = Field(default=None)
+
 
     @property
     def ai_available(self) -> bool:
         if not self.ai_enabled:
             return False
         return bool(self.openai_api_key) or self.llm_provider == "ollama"
+
+
+    @property
+    def active_embedding_model(self) -> str:
+        """The model name for the currently configured embedding provider."""       
+        if self.embedding_provider == "ollama":
+            return self.ollama_embedding_model
+        return self.openai_embedding_model
 
 
 

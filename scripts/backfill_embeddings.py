@@ -33,7 +33,11 @@ async def _run(args: argparse.Namespace) -> int:
         EmbeddingBackfillService,
     )
 
-    model = settings.openai_embedding_model
+    model = (
+        settings.ollama_embedding_model
+        if settings.embedding_provider == "ollama"
+        else settings.openai_embedding_model
+    )    
     print(f"Model:      {model}")
     print(f"Batch size: {args.batch_size}")
     print(f"Site:       {args.site or 'all'}")
@@ -61,37 +65,72 @@ async def _run(args: argparse.Namespace) -> int:
                 print("Nothing to do.")
                 return 0
 
-            while True:
-                if args.limit and total_embedded >= args.limit:
-                    print(f"Reached --limit {args.limit}")
-                    break
+            after_id = None
+            total_embedded = 0
+            total_failed = 0
+            started = time.monotonic()
 
-                stats, offset = await svc.backfill_batch(
-                    offset=offset,
-                    batch_size=args.batch_size,
-                    site=args.site,
-                    force=args.force,
-                )
+            try:
+                async with async_session_maker() as db:
+                    svc = EmbeddingBackfillService(db, model=model)
 
-                if stats.total_candidates == 0:
-                    print("No more candidates.")
-                    break
+                    pending = await svc.count_pending()
+                    print(f"Pending before run: {pending}")
 
-                total_embedded += stats.embedded
-                total_failed += stats.failed
+                    if args.dry_run:
+                        print("Dry run — nothing written.")
+                        return 0
 
-                elapsed = time.monotonic() - started
-                rate = total_embedded / elapsed if elapsed > 0 else 0
-                print(
-                    f"  batch done | "
-                    f"embedded={total_embedded:>6} "
-                    f"failed={total_failed:>4} "
-                    f"offset={offset:>6} "
-                    f"rate={rate:>5.1f}/s"
-                )
+                    if pending == 0 and not args.force:
+                        print("Nothing to do.")
+                        return 0
 
-                if args.limit and total_embedded >= args.limit:
-                    break
+                    empty_batches = 0
+                    while True:
+                        if args.limit and total_embedded >= args.limit:
+                            print(f"Reached --limit {args.limit}")
+                            break
+
+                        stats, next_after_id = await svc.backfill_batch(
+                            batch_size=args.batch_size,
+                            after_id=after_id,
+                            site=args.site,
+                            force=args.force,
+                        )
+
+                        if stats.total_candidates == 0:
+                            print("Batch exhausted.")
+                            break
+
+                        after_id = next_after_id
+                        total_embedded += stats.embedded
+                        total_failed += stats.failed
+
+                        elapsed = time.monotonic() - started
+                        rate = total_embedded / elapsed if elapsed > 0 else 0
+                        print(
+                            f"  batch done | "
+                            f"embedded={total_embedded:>6} "
+                            f"failed={total_failed:>4} "
+                            f"after_id={str(after_id)[:8] if after_id else '-':>8} "
+                            f"rate={rate:>5.1f}/s"
+                        )
+
+                        if args.limit and total_embedded >= args.limit:
+                            break
+
+            except KeyboardInterrupt:
+                print("\nInterrupted. Progress up to the last committed batch is safe.")
+                return 130
+            finally:
+                try:
+                    await close_redis()
+                except Exception:
+                    pass
+                try:
+                    await dispose_engine()
+                except Exception:
+                    pass
 
     except KeyboardInterrupt:
         print("\nInterrupted. Progress up to the last committed batch "

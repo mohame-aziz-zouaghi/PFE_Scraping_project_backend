@@ -19,6 +19,7 @@ from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base
+from app.models.product import Product
 
 EMBEDDING_DIM = 768
 
@@ -50,6 +51,13 @@ class ProductEmbedding(Base):
         server_default=func.now(),
         onupdate=func.now(),
         nullable=False,
+    )
+
+    canonical_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("canonical_products.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
     )
 
     product: Mapped["Product"] = relationship(  # noqa: F821

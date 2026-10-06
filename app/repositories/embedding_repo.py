@@ -168,19 +168,16 @@ class EmbeddingRepo:
     # ═══════════════════════════════════════════════════════
     # Backfill helpers
     # ═══════════════════════════════════════════════════════
-    async def iter_products_needing_embedding_offset(
-        self,
-        *,
-        model: str,
-        offset: int,
-        batch_size: int = 500,
-        site: Optional[str] = None,
-    ) -> list[Product]:
+    async def iter_products_needing_embedding(
+    self,
+    *,
+    model: str,
+    batch_size: int = 500,
+    site: Optional[str] = None,
+) -> list[Product]:
         """
-        Return enabled products with NO embedding row for this model.
-
-        Uses NOT EXISTS (anti-join). Postgres optimizes this with the
-        ix_product_embeddings_product index — fast even at 63k rows.
+        Return the FIRST `batch_size` enabled products missing an embedding.
+        Caller processes them, commits, and calls again — no offset.
         """
         subq = (
             select(ProductEmbedding.product_id)
@@ -193,7 +190,6 @@ class EmbeddingRepo:
             .where(Product.is_enabled.is_(True))
             .where(~subq)
             .order_by(Product.id)
-            .offset(offset)
             .limit(batch_size)
         )
         if site:
@@ -219,3 +215,39 @@ class EmbeddingRepo:
     async def total_embedded(self, model: Optional[str] = None) -> int:
         """Count embeddings, optionally for a specific model."""
         return await self.count_ready(model)
+
+
+    async def fetch_missing_batch(
+    self,
+    *,
+    model: str,
+    limit: int,
+    after_id: Optional[UUID] = None,
+    site: Optional[str] = None,
+) -> list[Product]:
+        """
+        Return up to `limit` enabled products that:
+        - have no embedding for `model`
+        - have id > after_id (cursor for stable pagination)
+
+        Ordered by id so the caller can advance `after_id` monotonically.
+        """
+        subq = (
+            select(ProductEmbedding.product_id)
+            .where(ProductEmbedding.model == model)
+            .where(ProductEmbedding.product_id == Product.id)
+            .exists()
+        )
+        stmt = (
+            select(Product)
+            .where(Product.is_enabled.is_(True))
+            .where(~subq)
+            .order_by(Product.id.asc())
+            .limit(limit)
+        )
+        if after_id is not None:
+            stmt = stmt.where(Product.id > after_id)
+        if site:
+            stmt = stmt.where(Product.site == site.lower())
+
+        return list((await self.db.execute(stmt)).scalars().all())

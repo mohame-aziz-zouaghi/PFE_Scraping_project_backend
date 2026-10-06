@@ -106,4 +106,8 @@ celery_app.conf.beat_schedule = {
         "schedule": crontab(hour="4", minute="0"),   # daily at 4 AM
         "kwargs": {"days": 90},
     },
+    "matching-nightly": {
+        "task": "matching.nightly",       # NOT full_run
+        "schedule": crontab(hour=3, minute=0),
+    },
 }

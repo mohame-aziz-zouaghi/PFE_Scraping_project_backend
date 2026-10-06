@@ -5,6 +5,7 @@ from app.api.v1 import (
     alerts,
     analytics,
     auth,
+    compare,
     monitoring,
     products,
     search,
@@ -22,6 +23,7 @@ api_router.include_router(monitoring.router, prefix="/monitoring", tags=["monito
 api_router.include_router(analytics.router, prefix="/analytics", tags=["analytics"])
 api_router.include_router(search.router, prefix="/search", tags=["search"])
 api_router.include_router(websocket.router, tags=["websocket"])
+api_router.include_router(compare.router, prefix="/compare", tags=["compare"])
 
 # Honeypot routes (must be LAST — they catch wild paths)
 register_honeypot_routes(api_router)

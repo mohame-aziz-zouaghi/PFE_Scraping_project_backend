@@ -105,3 +105,19 @@ async def get_current_admin(
     if user.role not in ("admin", "superadmin") and user.tier != "admin":
         raise AuthorizationError("Admin access required")
     return user
+
+
+
+async def require_superadmin(
+    user: User = Depends(get_current_user),
+) -> User:
+    """Gate for the highest-privilege operations.
+
+    Assumes User has either `role == 'superadmin'` or `is_superadmin`.
+    Adjust to match your model.
+    """
+    role = getattr(user, "role", None)
+    is_super = getattr(user, "is_superadmin", False)
+    if not (is_super or role == "superadmin"):
+        raise AuthorizationError("Superadmin privileges required.")
+    return user

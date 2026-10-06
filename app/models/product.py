@@ -148,6 +148,13 @@ class Product(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    canonical_id: Mapped[Optional[UUID]] = mapped_column(
+        PG_UUID(as_uuid=True),
+        ForeignKey("canonical_products.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     def __repr__(self) -> str:
         name = (self.name or "")[:30]
         return f"<Product {self.site}/{self.main_product_id} {name!r}>"

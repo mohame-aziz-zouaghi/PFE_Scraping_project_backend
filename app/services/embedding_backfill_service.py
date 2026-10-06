@@ -93,52 +93,53 @@ class EmbeddingBackfillService:
     # Batched backfill
     # ═══════════════════════════════════════════════════════
     async def backfill_batch(
-        self,
-        *,
-        offset: int,
-        batch_size: int,
-        site: Optional[str] = None,
-        force: bool = False,
-    ) -> tuple[BackfillStats, int]:
+    self,
+    *,
+    batch_size: int,
+    after_id: Optional[UUID] = None,
+    site: Optional[str] = None,
+    force: bool = False,
+) -> tuple[BackfillStats, Optional[UUID]]:
         """
-        Embed one page of products.
-        Returns (stats, next_offset).
+        Embed the next batch of products after `after_id`.
+
+        Returns (stats, next_after_id). If `stats.total_candidates == 0`,
+        the batch is exhausted — caller should stop.
         """
-        products = await self.repo.iter_products_needing_embedding_offset(
+        products = await self.repo.fetch_missing_batch(
             model=self.model,
-            offset=offset,
-            batch_size=batch_size,
+            limit=batch_size,
+            after_id=after_id,
             site=site,
         )
         stats = BackfillStats(total_candidates=len(products))
 
         if not products:
-            return stats, offset
+            return stats, None
 
-        # Build texts, skip empties
+        next_after_id = products[-1].id  # highest id in this batch
+
         texts: list[str] = []
         product_ids: list[UUID] = []
         for p in products:
             t = build_embedding_text(p)
             if not t.strip():
-                stats.failed += 1
+                stats.skipped += 1
                 continue
             texts.append(t)
             product_ids.append(p.id)
 
         if not texts:
-            return stats, offset + len(products)
+            stats.processed = len(products)
+            return stats, next_after_id
 
-        # Batch embed (embedder handles caching internally)
         try:
             vectors = await self.embedder.embed_batch(texts)
         except Exception as e:
-            logger.error("backfill_embed_batch_failed", error=str(e))
+            logger.error("backfill_embed_batch_failed", error=str(e)[:300])
             stats.failed += len(product_ids)
-            return stats, offset + len(products)
+            return stats, next_after_id
 
-        # Upsert each product in its own savepoint so one failure
-        # doesn't abort the entire batch.
         for pid, text, vec in zip(product_ids, texts, vectors):
             savepoint = await self.db.begin_nested()
             try:
@@ -156,21 +157,14 @@ class EmbeddingBackfillService:
                 logger.error(
                     "backfill_upsert_failed",
                     product_id=str(pid),
+                    source_text_len=len(text),
                     error=str(e)[:300],
                 )
                 stats.failed += 1
 
         await self.db.commit()
-
         stats.processed = len(products)
-        logger.info(
-            "backfill_batch_done",
-            offset=offset,
-            batch_size=len(products),
-            embedded=stats.embedded,
-            failed=stats.failed,
-        )
-        return stats, offset + len(products)
+        return stats, next_after_id
 
     async def count_pending(self) -> int:
         """Number of enabled products missing an embedding for this model."""
