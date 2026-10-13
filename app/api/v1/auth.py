@@ -9,10 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import get_current_user
 from app.config import settings
 from app.core.audit import log_action
-from app.core.exceptions import (
-    AuthenticationError,
-    ConflictError,
-)
+from app.core.exceptions import AuthenticationError, ConflictError
 from app.core.logging_config import get_logger
 from app.core.rate_limit import rate_limit_anon, rate_limit_user
 from app.core.security import (
@@ -28,7 +25,19 @@ from app.core.security import (
 )
 from app.db.session import get_db
 from app.models.user import User
-from app.schemas.auth import ChangePasswordRequest, ForgotPasswordRequest, MessageResponse, ResendVerificationRequest, ResetPasswordRequest, TokenResponse, UserLogin, UserRegister, UserResponse, VerifyEmailRequest
+from app.schemas.auth import (
+    ChangePasswordRequest,
+    ForgotPasswordRequest,
+    MessageResponse,
+    RegisterResponse,
+    ResendVerificationRequest,
+    ResetPasswordRequest,
+    TokenResponse,
+    UserLogin,
+    UserRegister,
+    UserResponse,
+    VerifyEmailRequest,
+)
 from app.services.auth_service import AuthService
 
 logger = get_logger(__name__)
@@ -47,7 +56,7 @@ def _client_ip(request: Request) -> str | None:
 # ═══════════════════════════════════════════════════════
 @router.post(
     "/register",
-    response_model=UserResponse,
+    response_model=RegisterResponse,
     status_code=status.HTTP_201_CREATED,
     dependencies=[rate_limit_anon(times=30, seconds=3600)],
 )
@@ -55,59 +64,47 @@ async def register(
     request: Request,
     payload: UserRegister,
     db: AsyncSession = Depends(get_db),
-):
-    """Register a new user. No cookies — client must call /login."""
-    existing = await db.execute(
-        select(User).where(
-            or_(
-                User.email == payload.email.lower(),
-                User.username == payload.username,
-            )
-        )
-    )
-    if existing.scalar_one_or_none():
-        raise ConflictError("Email or username already registered")
+) -> RegisterResponse:
+    """Register a new user and send a verification email.
 
-    user = User(
-        email=payload.email.lower(),
-        username=payload.username,
-        display_name=payload.username,
-        hashed_password=hash_password(payload.password),
-        role="user",
-        tier="free",
-        is_active=True,
-        is_verified=False,
-        password_changed_at=datetime.now(timezone.utc),
-        signup_ip=_client_ip(request),
-        signup_user_agent=request.headers.get("user-agent"),
-        signup_source="web",
-    )
-    db.add(user)
-    await db.flush()
-
-    # Issue verification token BEFORE commit (so it lands in the same tx)
+    Response includes `verification_expires_at` so the frontend can
+    run a live countdown on the register wizard's final step.
+    """
     svc = AuthService(db)
-    raw_token = await svc.issue_verification_token(user)
 
-    await log_action(db, request, "user.register", f"user:{user.id}", user.id)
+    response, raw_token = await svc.register(
+        email=payload.email,
+        username=payload.username,
+        password=payload.password,
+        display_name=payload.display_name,
+        phone=payload.phone,
+        ip=_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        source="web",
+    )
+
+    await log_action(
+        db,
+        request,
+        "user.register",
+        f"user:{response.user_id}",
+        response.user_id,
+    )
     await db.commit()
-    await db.refresh(user)
 
     # Send AFTER commit — SMTP failure won't roll back the user
-    sent = await svc.send_verification_email(user, raw_token)
+    user = await db.get(User, response.user_id)
+    if user is not None:
+        sent = await svc.send_verification_email(user, raw_token)
+        logger.info(
+            "user_registered",
+            user_id=str(user.id),
+            email_sent=sent,
+        )
 
-    logger.info(
-        "user_registered",
-        user_id=str(user.id),
-        email=user.email,
-        email_sent=sent,
-    )
-    return user
+    return response
 
 
-# ═══════════════════════════════════════════════════════
-# POST /login
-# ═══════════════════════════════════════════════════════
 # ═══════════════════════════════════════════════════════
 # POST /login
 # ═══════════════════════════════════════════════════════
@@ -122,24 +119,14 @@ async def login(
     payload: UserLogin,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Authenticate and set session cookies.
-
-    All validation (deleted, banned, locked, password, unverified)
-    lives in AuthService.login — this endpoint only translates the
-    result into an HTTP response.
-    """
     svc = AuthService(db)
-
     user, access_token, refresh_token = await svc.login(
         email=payload.email,
         password=payload.password,
         ip=_client_ip(request),
         user_agent=request.headers.get("user-agent"),
     )
-
     set_auth_cookies(response, access_token, refresh_token)
-
     return TokenResponse(
         access_token=access_token,
         expires_in=settings.access_token_expire_minutes * 60,
@@ -173,7 +160,6 @@ async def refresh(
     result = await db.execute(select(User).where(User.id == user_uuid))
     user = result.scalar_one_or_none()
 
-    # can_login covers is_active, is_deleted, is_banned, lockout
     if not user or not user.can_login:
         clear_auth_cookies(response)
         raise AuthenticationError("Invalid refresh token")
@@ -211,8 +197,14 @@ async def logout(
 # GET /me
 # ═══════════════════════════════════════════════════════
 @router.get("/me", response_model=UserResponse)
-async def me(user: User = Depends(get_current_user)):
-    return user
+async def me(user: User = Depends(get_current_user)) -> UserResponse:
+    """Return the current user's public profile.
+
+    The response_model filters out everything not listed on
+    UserResponse — sensitive fields (tokens, hashes, IPs, ban
+    metadata) never leave the server.
+    """
+    return UserResponse.model_validate(user)
 
 
 # ═══════════════════════════════════════════════════════
@@ -228,7 +220,6 @@ async def verify_email(
     payload: VerifyEmailRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Consume an email verification token."""
     svc = AuthService(db)
     user = await svc.verify_email(payload.token)
     await log_action(
@@ -236,6 +227,30 @@ async def verify_email(
     )
     await db.commit()
     return MessageResponse(message="Email verified successfully")
+
+
+# ═══════════════════════════════════════════════════════
+# GET /verification-status  (used by the register wizard)
+# ═══════════════════════════════════════════════════════
+@router.get(
+    "/verification-status",
+    dependencies=[rate_limit_anon(times=60, seconds=60)],
+)
+async def verification_status(
+    email: str,
+    db: AsyncSession = Depends(get_db),
+) -> dict:
+    """Return whether an email has been verified.
+
+    Only exposes a boolean — does not leak whether the account
+    exists in a distinguishable way. If the email is unknown,
+    returns `is_verified=False` (same as an unverified account).
+    """
+    result = await db.execute(
+        select(User.is_verified).where(User.email == email.lower())
+    )
+    is_verified = result.scalar_one_or_none()
+    return {"is_verified": bool(is_verified)}
 
 
 # ═══════════════════════════════════════════════════════
@@ -251,14 +266,16 @@ async def resend_verification(
     payload: ResendVerificationRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Resend the verification email. Always returns 200 — does not reveal
-    whether the email is registered.
+    """Always returns 200 — does not reveal whether the email is
+    registered.
     """
     svc = AuthService(db)
     await svc.resend_verification(payload.email)
     return MessageResponse(
-        message="If that email exists and isn't verified, a new link was sent."
+        message=(
+            "If that email exists and isn't verified, "
+            "a new link was sent."
+        )
     )
 
 
@@ -275,14 +292,12 @@ async def forgot_password(
     payload: ForgotPasswordRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Request a password reset link. Always returns 200 — never reveals
-    whether the email is registered.
-    """
     svc = AuthService(db)
     await svc.request_password_reset(payload.email)
     return MessageResponse(
-        message="If that email is registered, a reset link has been sent."
+        message=(
+            "If that email is registered, a reset link has been sent."
+        )
     )
 
 
@@ -300,14 +315,12 @@ async def reset_password(
     payload: ResetPasswordRequest,
     db: AsyncSession = Depends(get_db),
 ):
-    """Consume a reset token and set a new password."""
     svc = AuthService(db)
     user = await svc.reset_password(payload.token, payload.new_password)
     await log_action(
         db, request, "auth.password_reset", f"user:{user.id}", user.id
     )
     await db.commit()
-    # Clear any existing session cookies — force fresh login
     clear_auth_cookies(response)
     return MessageResponse(
         message="Password reset successfully. Please log in."
@@ -329,14 +342,14 @@ async def change_password(
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Change password while logged in."""
     svc = AuthService(db)
-    await svc.change_password(user, payload.current_password, payload.new_password)
+    await svc.change_password(
+        user, payload.current_password, payload.new_password
+    )
     await log_action(
         db, request, "auth.password_changed", f"user:{user.id}", user.id
     )
     await db.commit()
-    # Force re-login on all devices
     clear_auth_cookies(response)
     return MessageResponse(
         message="Password changed. Please log in again."

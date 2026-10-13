@@ -8,8 +8,10 @@ from app.api.v1 import (
     compare,
     monitoring,
     products,
+    recommendations,
     search,
     websocket,
+    wishlist,
 )
 from app.core.honeypot import register_honeypot_routes
 
@@ -24,6 +26,8 @@ api_router.include_router(analytics.router, prefix="/analytics", tags=["analytic
 api_router.include_router(search.router, prefix="/search", tags=["search"])
 api_router.include_router(websocket.router, tags=["websocket"])
 api_router.include_router(compare.router, prefix="/compare", tags=["compare"])
+api_router.include_router(recommendations.router, prefix="/recommendations", tags=["recommendations"])
+api_router.include_router(wishlist.router, prefix="/wishlist", tags=["wishlist"])
 
 # Honeypot routes (must be LAST — they catch wild paths)
 register_honeypot_routes(api_router)

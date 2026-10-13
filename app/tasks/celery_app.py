@@ -110,4 +110,12 @@ celery_app.conf.beat_schedule = {
         "task": "matching.nightly",       # NOT full_run
         "schedule": crontab(hour=3, minute=0),
     },
+    "recs-refresh-nightly": {
+    "task": "recs.refresh_all_users",
+    "schedule": crontab(hour=4, minute=0),
+    },
+    "recs-purge-expired": {
+        "task": "recs.purge_expired",
+        "schedule": crontab(minute="*/30"),
+    },
 }

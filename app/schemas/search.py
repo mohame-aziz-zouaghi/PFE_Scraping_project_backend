@@ -24,6 +24,8 @@ class TextSearchRequest(BaseModel):
         default="relevance",
         pattern="^(relevance|price|price_desc|recent)$",
     )
+    session_id: Optional[str] = Field(default=None, max_length=64)
+
 
 
 class SemanticSearchRequest(BaseModel):
@@ -32,6 +34,8 @@ class SemanticSearchRequest(BaseModel):
     site: Optional[str] = Field(default=None, max_length=50)
     limit: int = Field(default=20, ge=1, le=100)
     min_similarity: float = Field(default=0.5, ge=0, le=1)
+    session_id: Optional[str] = Field(default=None, max_length=64)
+
 
 
 class SearchResult(BaseModel):

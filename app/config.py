@@ -139,6 +139,10 @@ class Settings(BaseSettings):
 
     celery_broker: str = Field(default="")
     celery_backend: str = Field(default="")
+        # ─── Public browse limit ────────────────────────────
+    # Anonymous users can see this many products per category before
+    # being asked to sign in. Set to 0 to require auth for everything.
+    public_products_per_category: int = Field(default=200, ge=0, le=10_000)
 
 
 
@@ -227,6 +231,9 @@ class Settings(BaseSettings):
 
     destructive_admin_token: str | None = Field(default=None)
 
+    # ─── Recommendations (Phase 4) ─────────────────────
+    recs_enabled: bool = Field(default=True)
+    recs_llm_enabled: bool = Field(default=False)
 
     @property
     def ai_available(self) -> bool:

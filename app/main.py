@@ -114,7 +114,6 @@ def create_app() -> FastAPI:
                 "redis": get_redis_pool_stats(),
             }
 
-
     @app.get("/ready", include_in_schema=False)
     async def ready(request: Request):
         redis_ok = await check_redis_health(request.app.state.redis)

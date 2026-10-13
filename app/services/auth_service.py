@@ -21,6 +21,7 @@ from app.core.security import (
     verify_password,
 )
 from app.models.user import User
+from app.schemas.auth import RegisterResponse
 from app.services.email_service import EmailService
 
 logger = get_logger(__name__)
@@ -39,10 +40,18 @@ class AuthService:
         email: str,
         username: str,
         password: str,
+        display_name: Optional[str] = None,
+        phone: Optional[str] = None,
         ip: Optional[str] = None,
         user_agent: Optional[str] = None,
         source: str = "web",
-    ) -> User:
+    ) -> tuple[RegisterResponse, str]:
+        """Create a user and issue a verification token.
+
+        Returns (response, raw_token). The raw token is returned so
+        the caller can email it AFTER commit — this way an SMTP
+        failure doesn't roll back the user row.
+        """
         existing = await self.db.execute(
             select(User).where(
                 or_(
@@ -57,7 +66,8 @@ class AuthService:
         user = User(
             email=email.lower(),
             username=username,
-            display_name=username,
+            display_name=display_name or username,
+            phone=phone,
             hashed_password=hash_password(password),
             role="user",
             tier="free",
@@ -71,13 +81,31 @@ class AuthService:
         self.db.add(user)
         await self.db.flush()
 
+        # Issue the verification token. The raw value is returned so
+        # the endpoint can email it after commit.
+        raw_token = await self.issue_verification_token(user)
+
+        # The expiry the frontend counts down from. This MUST match
+        # the TTL used inside verify_email — otherwise the UI shows
+        # time remaining for a token that's already dead.
+        expires_at = user.email_verify_sent_at + timedelta(
+            hours=settings.email_verify_token_ttl_hours
+        )
+
         logger.info(
             "user_registered",
             user_id=str(user.id),
             email=user.email,
             ip=ip,
         )
-        return user
+
+        response = RegisterResponse(
+            user_id=user.id,
+            email=user.email,
+            username=user.username,
+            verification_expires_at=expires_at,
+        )
+        return response, raw_token
 
     # ═══════════════════════════════════════════════════════
     # Login — every failure case handled
@@ -110,16 +138,19 @@ class AuthService:
         # ── Soft deleted
         if user.is_deleted:
             await log_action(
-                self.db, action="auth.login_failed",
+                self.db,
+                action="auth.login_failed",
                 resource=f"user:{user.id}",
-                details={"reason": "deleted"}, user_id=user.id,
+                details={"reason": "deleted"},
+                user_id=user.id,
             )
             raise AuthenticationError("Account is no longer available")
 
         # ── Banned (permanent or temporary)
         if user.is_currently_banned:
             await log_action(
-                self.db, action="auth.login_failed",
+                self.db,
+                action="auth.login_failed",
                 resource=f"user:{user.id}",
                 details={"reason": "banned", "ban_reason": user.ban_reason},
                 user_id=user.id,
@@ -139,7 +170,8 @@ class AuthService:
         # ── Currently locked
         if user.is_currently_locked:
             await log_action(
-                self.db, action="auth.login_failed",
+                self.db,
+                action="auth.login_failed",
                 resource=f"user:{user.id}",
                 details={
                     "reason": "locked",
@@ -158,19 +190,23 @@ class AuthService:
         # ── Inactive
         if not user.is_active:
             await log_action(
-                self.db, action="auth.login_failed",
+                self.db,
+                action="auth.login_failed",
                 resource=f"user:{user.id}",
-                details={"reason": "inactive"}, user_id=user.id,
+                details={"reason": "inactive"},
+                user_id=user.id,
             )
             raise AuthenticationError("Account inactive")
 
         # ── Password check
-                # ── Password check
         if not verify_password(password, user.hashed_password):
             user.failed_login_attempts = (user.failed_login_attempts or 0) + 1
             user.last_failed_login_at = now
 
-            if user.failed_login_attempts >= settings.max_failed_login_attempts:
+            if (
+                user.failed_login_attempts
+                >= settings.max_failed_login_attempts
+            ):
                 user.locked_until = now + timedelta(
                     minutes=settings.account_lockout_minutes
                 )
@@ -184,7 +220,8 @@ class AuthService:
 
             await self.db.commit()
             await log_action(
-                self.db, action="auth.login_failed",
+                self.db,
+                action="auth.login_failed",
                 resource=f"user:{user.id}",
                 details={
                     "reason": "bad_password",
@@ -194,15 +231,15 @@ class AuthService:
             )
             raise AuthenticationError("Invalid credentials")
 
-        # ─────────────────────────────────────────────────────
-        # ✨ NEW — Email verification gate
+        # ── Email verification gate
         # Only reached after a correct password, so this message
         # does not leak whether the account exists.
-        # ─────────────────────────────────────────────────────
         if not user.is_verified:
             await log_action(
-                self.db, action="auth.login_blocked_unverified",
-                resource=f"user:{user.id}", user_id=user.id,
+                self.db,
+                action="auth.login_blocked_unverified",
+                resource=f"user:{user.id}",
+                user_id=user.id,
                 details={"email": user.email, "ip": ip},
             )
             await self.db.commit()
@@ -227,8 +264,10 @@ class AuthService:
         refresh_token = create_refresh_token(str(user.id))
 
         await log_action(
-            self.db, action="auth.login_success",
-            resource=f"user:{user.id}", user_id=user.id,
+            self.db,
+            action="auth.login_success",
+            resource=f"user:{user.id}",
+            user_id=user.id,
             details={"ip": ip},
         )
         await self.db.commit()
@@ -280,7 +319,8 @@ class AuthService:
         target.banned_at = now
         target.banned_until = (
             now + timedelta(hours=duration_hours)
-            if duration_hours else None
+            if duration_hours
+            else None
         )
         target.ban_reason = reason
         target.ban_notes = notes
@@ -315,26 +355,34 @@ class AuthService:
         target.banned_by = None
 
         await log_action(
-            self.db, action="user.unbanned",
-            resource=f"user:{target.id}", user_id=admin.id,
+            self.db,
+            action="user.unbanned",
+            resource=f"user:{target.id}",
+            user_id=admin.id,
         )
         await self.db.commit()
-        logger.info("user_unbanned", target=str(target.id), by=str(admin.id))
+        logger.info(
+            "user_unbanned", target=str(target.id), by=str(admin.id)
+        )
         return target
 
     # ═══════════════════════════════════════════════════════
     # Soft delete / restore
     # ═══════════════════════════════════════════════════════
-    async def soft_delete(self, *, target: User, reason: str = "user_request"):
+    async def soft_delete(
+        self, *, target: User, reason: str = "user_request"
+    ) -> User:
         target.is_deleted = True
         target.deleted_at = datetime.now(timezone.utc)
         target.deletion_reason = reason
         target.is_active = False
         await self.db.commit()
-        logger.info("user_soft_deleted", target=str(target.id), reason=reason)
+        logger.info(
+            "user_soft_deleted", target=str(target.id), reason=reason
+        )
         return target
 
-    async def restore(self, *, target: User):
+    async def restore(self, *, target: User) -> User:
         target.is_deleted = False
         target.deleted_at = None
         target.deletion_reason = None
@@ -342,24 +390,23 @@ class AuthService:
         await self.db.commit()
         return target
 
-
-
-        # ═══════════════════════════════════════════════════════
+    # ═══════════════════════════════════════════════════════
     # Email verification
     # ═══════════════════════════════════════════════════════
     async def issue_verification_token(self, user: User) -> str:
-        """
-        Generate a fresh verification token, persist its hash,
-        return the RAW token (caller emails it).
-        """
+        """Generate a fresh verification token, persist its hash,
+        return the RAW token (caller emails it)."""
         raw = generate_opaque_token()
         user.email_verify_token = hash_opaque_token(raw)
         user.email_verify_sent_at = datetime.now(timezone.utc)
         await self.db.flush()
         return raw
 
-    async def send_verification_email(self, user: User, raw_token: str) -> bool:
-        """Send the verification email using an already-issued raw token."""
+    async def send_verification_email(
+        self, user: User, raw_token: str
+    ) -> bool:
+        """Send the verification email using an already-issued raw
+        token."""
         return await EmailService.send_verification(user, raw_token)
 
     async def verify_email(self, raw_token: str) -> User:
@@ -370,9 +417,13 @@ class AuthService:
         user = result.scalar_one_or_none()
 
         if not user:
-            raise AuthenticationError("Invalid or expired verification link")
+            raise AuthenticationError(
+                "Invalid or expired verification link"
+            )
         if user.is_deleted or user.is_currently_banned:
-            raise AuthenticationError("Invalid or expired verification link")
+            raise AuthenticationError(
+                "Invalid or expired verification link"
+            )
         if user.is_verified:
             # Idempotent — already verified
             user.email_verify_token = None
@@ -394,16 +445,24 @@ class AuthService:
         user.email_verify_sent_at = None
 
         await log_action(
-            self.db, action="user.email_verified",
-            resource=f"user:{user.id}", user_id=user.id,
+            self.db,
+            action="user.email_verified",
+            resource=f"user:{user.id}",
+            user_id=user.id,
         )
         await self.db.commit()
         logger.info("email_verified", user_id=str(user.id))
         return user
 
-    async def resend_verification(self, email: str) -> None:
-        """
-        Always returns success — never leak whether an email exists.
+    async def resend_verification(
+        self, email: str
+    ) -> Optional[datetime]:
+        """Always silent on failure — never leaks whether an email
+        exists.
+
+        Returns the new expiry (or existing one if throttled), or
+        None if the caller shouldn't see a deadline. The API layer
+        ignores the return value; it's there for future callers.
         """
         result = await self.db.execute(
             select(User).where(User.email == email.lower())
@@ -412,25 +471,34 @@ class AuthService:
 
         # Silent no-op in all these cases
         if not user or user.is_deleted or user.is_currently_banned:
-            return
+            return None
         if user.is_verified:
-            return
+            return None
+        if not user.is_active:
+            return None
 
         # Throttle: don't resend if issued in last 60 seconds
         if user.email_verify_sent_at:
             delta = datetime.now(timezone.utc) - user.email_verify_sent_at
             if delta.total_seconds() < 60:
-                return
+                return user.email_verify_sent_at + timedelta(
+                    hours=settings.email_verify_token_ttl_hours
+                )
 
-        await self.send_verification_email(user)
+        raw = await self.issue_verification_token(user)
+        await self.db.commit()
+        await self.send_verification_email(user, raw)
+
+        return user.email_verify_sent_at + timedelta(
+            hours=settings.email_verify_token_ttl_hours
+        )
 
     # ═══════════════════════════════════════════════════════
     # Password reset
     # ═══════════════════════════════════════════════════════
     async def request_password_reset(self, email: str) -> None:
-        """
-        Always returns success — never leak whether an email exists.
-        """
+        """Always returns success — never leak whether an email
+        exists."""
         result = await self.db.execute(
             select(User).where(User.email == email.lower())
         )
@@ -458,14 +526,18 @@ class AuthService:
         await self.db.flush()
 
         await log_action(
-            self.db, action="auth.password_reset_requested",
-            resource=f"user:{user.id}", user_id=user.id,
+            self.db,
+            action="auth.password_reset_requested",
+            resource=f"user:{user.id}",
+            user_id=user.id,
         )
         await self.db.commit()
 
         await EmailService.send_password_reset(user, raw)
 
-    async def reset_password(self, raw_token: str, new_password: str) -> User:
+    async def reset_password(
+        self, raw_token: str, new_password: str
+    ) -> User:
         hashed = hash_opaque_token(raw_token)
         result = await self.db.execute(
             select(User).where(User.password_reset_token == hashed)
@@ -474,11 +546,18 @@ class AuthService:
 
         if not user:
             raise AuthenticationError("Invalid or expired reset link")
-        if user.is_deleted or user.is_currently_banned or not user.is_active:
+        if (
+            user.is_deleted
+            or user.is_currently_banned
+            or not user.is_active
+        ):
             raise AuthenticationError("Invalid or expired reset link")
 
         now = datetime.now(timezone.utc)
-        if not user.password_reset_expires_at or user.password_reset_expires_at < now:
+        if (
+            not user.password_reset_expires_at
+            or user.password_reset_expires_at < now
+        ):
             user.password_reset_token = None
             user.password_reset_expires_at = None
             await self.db.commit()
@@ -492,14 +571,17 @@ class AuthService:
         user.password_reset_token = None
         user.password_reset_expires_at = None
 
-        # Security: unlock the account and reset counters on successful reset
+        # Security: unlock the account and reset counters on
+        # successful reset.
         user.failed_login_attempts = 0
         user.locked_until = None
         user.lockout_reason = None
 
         await log_action(
-            self.db, action="auth.password_reset_success",
-            resource=f"user:{user.id}", user_id=user.id,
+            self.db,
+            action="auth.password_reset_success",
+            resource=f"user:{user.id}",
+            user_id=user.id,
         )
         await self.db.commit()
         logger.info("password_reset", user_id=str(user.id))
@@ -515,7 +597,9 @@ class AuthService:
             raise AuthenticationError("Current password is incorrect")
 
         if current_password == new_password:
-            raise ConflictError("New password must differ from current")
+            raise ConflictError(
+                "New password must differ from current"
+            )
 
         now = datetime.now(timezone.utc)
         user.hashed_password = hash_password(new_password)
@@ -526,8 +610,10 @@ class AuthService:
         user.password_reset_expires_at = None
 
         await log_action(
-            self.db, action="auth.password_changed",
-            resource=f"user:{user.id}", user_id=user.id,
+            self.db,
+            action="auth.password_changed",
+            resource=f"user:{user.id}",
+            user_id=user.id,
         )
         await self.db.commit()
         logger.info("password_changed", user_id=str(user.id))

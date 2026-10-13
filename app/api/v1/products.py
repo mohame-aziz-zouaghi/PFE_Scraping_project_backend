@@ -1,46 +1,43 @@
 """Product endpoints."""
-from http.client import HTTPException
 from typing import Optional
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api.deps import get_current_user_optional
+from app.config import settings
 from app.core.rate_limit import rate_limit_anon, rate_limit_user
 from app.db.session import get_db
 from app.repositories.embedding_repo import EmbeddingRepo
 from app.schemas.product import (
     ChangeHistoryResponse,
+    EmbeddingStatsResponse,
     PaginatedProducts,
     PriceHistoryResponse,
     ProductDetail,
+    SimilarProduct,
     SimilarProductsResponse,
 )
 from app.services.product_service import ProductService
-from fastapi import HTTPException, status as http_status
-from app.config import settings
-from app.repositories.embedding_repo import EmbeddingRepo
-from app.services.embedding_service import EmbeddingService
-from app.schemas.product import (
-    SimilarProduct,
-    SimilarProductsResponse,
-    EmbeddingStatsResponse,
-)
 
 router = APIRouter()
 
 
+# ═══════════════════════════════════════════════════════
+# List
+# ═══════════════════════════════════════════════════════
 @router.get(
     "",
     response_model=PaginatedProducts,
-        dependencies=[rate_limit_anon(times=100, seconds=60)],
+    dependencies=[rate_limit_anon(times=100, seconds=60)],
 )
 async def list_products(
     request: Request,
     page: int = Query(1, ge=1, le=1000),
     page_size: int = Query(20, ge=1, le=100),
     site: Optional[str] = Query(None, max_length=50),
-    availability: Optional[str] = Query(None, max_length=20),
+    availability: Optional[str] = Query(None, max_length=50),
     brand: Optional[str] = Query(None, max_length=200),
     category: Optional[str] = Query(None, max_length=200),
     min_price: Optional[float] = Query(None, ge=0),
@@ -50,9 +47,20 @@ async def list_products(
         pattern="^(name|price|brand|category|last_updated_at|last_checked)$",
     ),
     sort_order: str = Query("desc", pattern="^(asc|desc)$"),
+    user=Depends(get_current_user_optional),   # <-- NEW
     db: AsyncSession = Depends(get_db),
 ):
-    """List products with filters + pagination."""
+    """List products.
+
+    Anonymous visitors see at most
+    `settings.public_products_per_category` items per view.
+    Signed-in users see everything.
+    """
+    anonymous_cap: Optional[int] = (
+        None
+        if user is not None
+        else settings.public_products_per_category
+    )
     service = ProductService(db)
     return await service.list_products(
         page=page,
@@ -65,23 +73,36 @@ async def list_products(
         max_price=max_price,
         sort_by=sort_by,
         sort_order=sort_order,
+        anonymous_cap=anonymous_cap,
     )
 
 
-@router.get("/{product_id}", response_model=ProductDetail,
-                dependencies=[rate_limit_anon(times=200, seconds=60)])
+# ═══════════════════════════════════════════════════════
+# Detail — every column
+# ═══════════════════════════════════════════════════════
+@router.get(
+    "/{product_id}",
+    response_model=ProductDetail,
+    dependencies=[rate_limit_anon(times=200, seconds=60)],
+)
 async def get_product(
     request: Request,
     product_id: UUID,
     db: AsyncSession = Depends(get_db),
 ):
-    """Get single product."""
+    """Get a single product with every column."""
     service = ProductService(db)
     return await service.get_product(product_id)
 
 
-@router.get("/{product_id}/history", response_model=PriceHistoryResponse,
-                dependencies=[rate_limit_anon(times=100, seconds=60)])
+# ═══════════════════════════════════════════════════════
+# History
+# ═══════════════════════════════════════════════════════
+@router.get(
+    "/{product_id}/history",
+    response_model=PriceHistoryResponse,
+    dependencies=[rate_limit_anon(times=100, seconds=60)],
+)
 async def get_price_history(
     request: Request,
     product_id: UUID,
@@ -89,13 +110,15 @@ async def get_price_history(
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get price history for a product."""
     service = ProductService(db)
     return await service.get_price_history(product_id, page, page_size)
 
 
-@router.get("/{product_id}/changes", response_model=ChangeHistoryResponse,
-                dependencies=[rate_limit_anon(times=100, seconds=60)])
+@router.get(
+    "/{product_id}/changes",
+    response_model=ChangeHistoryResponse,
+    dependencies=[rate_limit_anon(times=100, seconds=60)],
+)
 async def get_change_history(
     request: Request,
     product_id: UUID,
@@ -103,13 +126,13 @@ async def get_change_history(
     page_size: int = Query(50, ge=1, le=200),
     db: AsyncSession = Depends(get_db),
 ):
-    """Get change history for a product."""
     service = ProductService(db)
     return await service.get_change_history(product_id, page, page_size)
 
 
-
-
+# ═══════════════════════════════════════════════════════
+# Similar products (embeddings)
+# ═══════════════════════════════════════════════════════
 @router.get(
     "/{product_id}/similar",
     response_model=SimilarProductsResponse,
@@ -122,23 +145,17 @@ async def similar_products(
     max_distance: float = Query(0.3, ge=0.0, le=1.0),
     db: AsyncSession = Depends(get_db),
 ):
-    """
-    Return products semantically similar to the given one, ranked by
-    cosine distance. Uses pgvector HNSW index.
-    """
+    """Nearest neighbours by embedding cosine distance."""
     repo = EmbeddingRepo(db)
+    model = settings.active_embedding_model
 
-    # 1. Fetch the source product's embedding
-    source_embedding = await repo.get_by_product(
-        product_id, settings.openai_embedding_model
-    )
+    source_embedding = await repo.get_by_product(product_id, model)
     if source_embedding is None:
         raise HTTPException(
-            status_code=http_status.HTTP_404_NOT_FOUND,
+            status_code=status.HTTP_404_NOT_FOUND,
             detail="Embedding not found for this product yet",
         )
 
-    # 2. Nearest-neighbour lookup
     neighbours = await repo.find_similar(
         query_vector=source_embedding.embedding,
         model=source_embedding.model,
@@ -148,12 +165,12 @@ async def similar_products(
         only_enabled=True,
     )
 
-    # 3. Shape the response
     items = [
         SimilarProduct(
             product_id=n["product"].id,
             site=n["product"].site,
             main_product_id=n["product"].main_product_id,
+            special_id=n["product"].special_id,
             name=n["product"].name,
             brand=n["product"].brand,
             category=n["product"].category,
@@ -183,9 +200,8 @@ async def similar_products(
     )
 
 
-# ─────────────────────────────────────────────────────
-# ENDPOINT 2 — /products/embeddings/stats
-# Paste at the bottom of app/api/v1/products.py
+# ═══════════════════════════════════════════════════════
+# Embedding stats (admin diagnostic)
 # ═══════════════════════════════════════════════════════
 @router.get(
     "/embeddings/stats",
@@ -196,9 +212,8 @@ async def embedding_stats(
     request: Request,
     db: AsyncSession = Depends(get_db),
 ):
-    """Diagnostic — how many products are embedded, how many pending."""
     repo = EmbeddingRepo(db)
-    model = settings.openai_embedding_model
+    model = settings.active_embedding_model
 
     total_embedded = await repo.count_ready()
     total_pending = await repo.total_pending(model)

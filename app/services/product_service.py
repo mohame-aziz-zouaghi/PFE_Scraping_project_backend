@@ -4,6 +4,7 @@ from uuid import UUID
 
 from sqlalchemy import and_, asc, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import defer
 
 from app.core.exceptions import NotFoundError
 from app.models.product import PriceHistory, Product, ProductChange
@@ -17,26 +18,37 @@ from app.schemas.product import (
     ProductSummary,
 )
 
-_SORTABLE = {"name", "price", "brand", "category", "last_updated_at", "last_checked"}
+_SORTABLE = {
+    "name",
+    "price",
+    "brand",
+    "category",
+    "last_updated_at",
+    "last_checked",
+}
 
 
 class ProductService:
     def __init__(self, db: AsyncSession):
         self.db = db
 
+    # ═══════════════════════════════════════════════════════
+    # List
+    # ═══════════════════════════════════════════════════════
     async def list_products(
-        self,
-        page: int,
-        page_size: int,
-        site: Optional[str] = None,
-        availability: Optional[str] = None,
-        brand: Optional[str] = None,
-        category: Optional[str] = None,
-        min_price: Optional[float] = None,
-        max_price: Optional[float] = None,
-        sort_by: str = "last_updated_at",
-        sort_order: str = "desc",
-    ) -> PaginatedProducts:
+    self,
+    page: int,
+    page_size: int,
+    site: Optional[str] = None,
+    availability: Optional[str] = None,
+    brand: Optional[str] = None,
+    category: Optional[str] = None,
+    min_price: Optional[float] = None,
+    max_price: Optional[float] = None,
+    sort_by: str = "last_updated_at",
+    sort_order: str = "desc",
+    anonymous_cap: Optional[int] = None,   # <-- NEW
+) -> PaginatedProducts:
         conditions = [Product.is_enabled == True]
         if site:
             conditions.append(Product.site == site.lower())
@@ -51,10 +63,28 @@ class ProductService:
         if max_price is not None:
             conditions.append(Product.price <= max_price)
 
+        # ── Anonymous cap ──────────────────────────────────
+        # Only apply when the caller explicitly asked for it (anonymous
+        # users). Enforced per-category when a category filter is set;
+        # otherwise across the whole result set.
+        requires_auth = False
+        auth_reason: Optional[str] = None
+        capped_total: Optional[int] = None
+
         count_stmt = (
             select(func.count()).select_from(Product).where(and_(*conditions))
         )
         total = (await self.db.execute(count_stmt)).scalar_one()
+
+        if anonymous_cap is not None and total > anonymous_cap:
+            capped_total = anonymous_cap
+            requires_auth = True
+            auth_reason = (
+                f"Sign in to browse beyond the first "
+                f"{anonymous_cap} products in this view."
+            )
+
+        effective_total = capped_total if capped_total is not None else total
 
         field = sort_by if sort_by in _SORTABLE else "last_updated_at"
         sort_col = getattr(Product, field)
@@ -63,20 +93,42 @@ class ProductService:
         stmt = (
             select(Product)
             .where(and_(*conditions))
+            .options(
+                defer(Product.description),
+                defer(Product.short_description),
+                defer(Product.images),
+            )
             .order_by(order_fn(sort_col))
             .limit(page_size)
             .offset((page - 1) * page_size)
         )
+        # If the cap would be exceeded by this page, trim the limit.
+        if capped_total is not None:
+            offset = (page - 1) * page_size
+            remaining = max(0, capped_total - offset)
+            stmt = stmt.limit(min(page_size, remaining))
+
         rows = (await self.db.execute(stmt)).scalars().all()
+
+        total_pages = (
+            (effective_total + page_size - 1) // page_size
+            if effective_total > 0
+            else 1
+        )
 
         return PaginatedProducts(
             items=[ProductSummary.model_validate(r) for r in rows],
-            total=total,
+            total=effective_total,
             page=page,
             page_size=page_size,
-            total_pages=(total + page_size - 1) // page_size,
+            total_pages=total_pages,
+            requires_auth=requires_auth,
+            auth_reason=auth_reason,
         )
 
+    # ═══════════════════════════════════════════════════════
+    # Detail — return every column
+    # ═══════════════════════════════════════════════════════
     async def get_product(self, product_id: UUID) -> ProductDetail:
         stmt = select(Product).where(Product.id == product_id)
         product = (await self.db.execute(stmt)).scalar_one_or_none()
@@ -84,6 +136,9 @@ class ProductService:
             raise NotFoundError(f"Product {product_id} not found")
         return ProductDetail.model_validate(product)
 
+    # ═══════════════════════════════════════════════════════
+    # History
+    # ═══════════════════════════════════════════════════════
     async def get_price_history(
         self, product_id: UUID, page: int, page_size: int
     ) -> PriceHistoryResponse:
