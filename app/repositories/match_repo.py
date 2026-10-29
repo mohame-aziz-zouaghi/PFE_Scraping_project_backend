@@ -164,3 +164,107 @@ class MatchRepo:
             v = await self.db.execute(text(sql))
             out[label] = int(v.scalar_one())
         return out
+
+
+
+
+    async def find_candidate_pairs_for_products(
+        self,
+        *,
+        model: str,
+        product_ids: list[UUID],
+        max_distance: float,
+        ) -> list[dict]:
+        """Same as find_candidate_pairs, but only among `product_ids`."""
+        if not product_ids:
+            return []
+        sql = text("""
+            SELECT
+                pe1.product_id AS product_a_id,
+                pe2.product_id AS product_b_id,
+                1 - (pe1.embedding <=> pe2.embedding) AS similarity,
+                (pe1.embedding <=> pe2.embedding) AS cosine_distance
+            FROM product_embeddings pe1
+            JOIN product_embeddings pe2
+            ON pe2.model = pe1.model
+            AND pe2.product_id <> pe1.product_id
+            WHERE pe1.model = :model
+            AND pe1.product_id = ANY(CAST(:ids AS uuid[]))
+            AND pe2.product_id = ANY(CAST(:ids AS uuid[]))
+            AND (pe1.embedding <=> pe2.embedding) <= :max_distance
+            AND pe1.product_id < pe2.product_id  -- dedupe pairs
+            ORDER BY cosine_distance ASC
+        """)
+        rows = (await self.db.execute(sql, {
+            "model": model,
+            "ids": [str(x) for x in product_ids],
+            "max_distance": max_distance,
+        })).all()
+        return [
+            {
+                "product_a_id": r.product_a_id,
+                "product_b_id": r.product_b_id,
+                "similarity": float(r.similarity),
+                "cosine_distance": float(r.cosine_distance),
+            }
+            for r in rows
+        ]
+
+
+    async def find_candidate_pairs_for_products(
+        self,
+        *,
+        model: str,
+        product_ids: list[UUID],
+        max_distance: float,
+    ) -> list[dict]:
+        """
+        Same as find_candidate_pairs, but only among the given
+        product IDs.
+
+        Used by targeted re-matching: after the verification loop
+        detaches a set of products from a bad canonical, this query
+        finds candidate pairs only among those products, so the
+        rest of the catalog isn't scanned.
+
+        Uses `product_id < product_id` to deduplicate (a, b) vs
+        (b, a) pairs — otherwise every pair would appear twice.
+        """
+        if not product_ids:
+            return []
+
+        sql = text(
+            """
+            SELECT
+                pe1.product_id AS product_a_id,
+                pe2.product_id AS product_b_id,
+                1 - (pe1.embedding <=> pe2.embedding) AS similarity,
+                (pe1.embedding <=> pe2.embedding) AS cosine_distance
+            FROM product_embeddings pe1
+            JOIN product_embeddings pe2
+              ON pe2.model = pe1.model
+             AND pe2.product_id <> pe1.product_id
+            WHERE pe1.model = :model
+              AND pe1.product_id = ANY(CAST(:ids AS uuid[]))
+              AND pe2.product_id = ANY(CAST(:ids AS uuid[]))
+              AND (pe1.embedding <=> pe2.embedding) <= :max_distance
+              AND pe1.product_id < pe2.product_id
+            ORDER BY cosine_distance ASC
+            """
+        )
+
+        rows = (await self.db.execute(sql, {
+            "model": model,
+            "ids": [str(x) for x in product_ids],
+            "max_distance": max_distance,
+        })).all()
+
+        return [
+            {
+                "product_a_id": r.product_a_id,
+                "product_b_id": r.product_b_id,
+                "similarity": float(r.similarity),
+                "cosine_distance": float(r.cosine_distance),
+            }
+            for r in rows
+        ]

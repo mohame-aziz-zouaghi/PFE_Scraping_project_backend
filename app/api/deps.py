@@ -74,6 +74,7 @@ async def get_current_user(
 
     # Expose to rate limiter and downstream handlers
     request.state.user = user
+    request.state.user_id = user.id
     return user
 
 

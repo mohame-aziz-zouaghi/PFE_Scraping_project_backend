@@ -235,6 +235,8 @@ class Settings(BaseSettings):
     recs_enabled: bool = Field(default=True)
     recs_llm_enabled: bool = Field(default=False)
 
+    base_group_debug_log: bool = False
+
     @property
     def ai_available(self) -> bool:
         if not self.ai_enabled:

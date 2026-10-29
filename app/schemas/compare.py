@@ -1,3 +1,4 @@
+# app/schemas/compare.py
 """Schemas for /compare endpoints."""
 from datetime import datetime
 from typing import Optional
@@ -22,6 +23,8 @@ class GroupListing(BaseModel):
     url: str
     main_image: Optional[str] = None
     last_checked: Optional[datetime] = None
+    # NEW -- so the frontend can compute "is this the cheapest listing"
+    effective_price: Optional[float] = None
 
 
 class VariantInBase(BaseModel):
@@ -65,20 +68,6 @@ class BaseGroupDetail(BaseModel):
     variants: list[VariantInBase]
 
 
-class CheapestResult(BaseModel):
-    group_id: UUID
-    canonical_name: str
-    cheapest_site: str
-    cheapest_price: float
-    site_count: int
-
-
-class CheapestResponse(BaseModel):
-    query: str
-    count: int
-    results: list[CheapestResult]
-
-
 class GroupHistoryPoint(BaseModel):
     date: str
     site: str
@@ -104,16 +93,35 @@ class ProductGroupResponse(BaseModel):
 
 
 class MatchStatsResponse(BaseModel):
-    candidates_found: int
-    auto_accepted: int
-    rule_rejected: int
-    variant_rejected: int
-    llm_checked: int
-    llm_accepted: int
-    llm_rejected: int
-    variant_groups_created: int
-    products_grouped: int
-    base_groups_created: int
-    base_groups_updated: int
-    pairs_linked: int
-    errors: int
+    """
+    Wrapper around whatever MatchingStats.as_dict() returns.
+
+    All known fields have defaults so a partial stats dict (e.g. from
+    a stats query that returns only persisted counters) still
+    validates. `extra="allow"` passes anything else through.
+    """
+    model_config = ConfigDict(extra="allow")
+
+    candidates_found: int = 0
+    auto_accepted: int = 0
+    rule_rejected: int = 0
+    variant_rejected: int = 0
+    llm_checked: int = 0
+    llm_accepted: int = 0
+    llm_rejected: int = 0
+    llm_errors: int = 0
+    llm_deferred: int = 0
+    cluster_rejected: int = 0
+    variant_groups_created: int = 0
+    products_grouped: int = 0
+    base_groups_created: int = 0
+    base_groups_updated: int = 0
+    pairs_linked: int = 0
+    integrity_errors: int = 0
+    errors: int = 0
+
+
+class MatchRunStatusResponse(BaseModel):
+    """Response for /compare/match/status."""
+    active: bool
+    progress: dict = {}

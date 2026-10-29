@@ -1,18 +1,28 @@
 """
 Repository for pgvector-backed product embeddings.
 
-The product_embeddings table is the single source of truth for
-"is this product embedded?" — there are no mirror columns on products.
+product_embeddings is the source of truth for "does this product
+have a vector?". products.embedding_status and
+products.last_embedded_at are denormalized mirrors that exist so
+queries like "show me all un-embedded products" don't need a
+LEFT JOIN against product_embeddings.
+
+The repo keeps the two tables in sync:
+
+    upsert()             →  writes embedding + sets 'complete'
+    delete_for_product() →  deletes embedding + sets 'pending'
+    invalidate()         →  same as delete_for_product, scoped
+                            optionally by model
 
 All queries are async and use the cosine distance operator (`<=>`).
 """
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Iterable, Optional
+from typing import Optional
 from uuid import UUID
 
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, select, text, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -103,7 +113,7 @@ class EmbeddingRepo:
         return results
 
     # ═══════════════════════════════════════════════════════
-    # Writes
+    # Writes — single-product
     # ═══════════════════════════════════════════════════════
     async def upsert(
         self,
@@ -115,12 +125,17 @@ class EmbeddingRepo:
         source_hash: str,
     ) -> None:
         """
-        Insert or update the embedding for (product_id, model).
+        Insert or update the embedding for (product_id, model)
+        AND mirror the state into `products.embedding_status`
+        and `products.last_embedded_at` — same transaction, so
+        the two tables never disagree.
 
         Uses ON CONFLICT on the natural key (product_id, model) — the
         unique constraint created by migration 006.
         """
         now = datetime.now(timezone.utc)
+
+        # ── 1. Write the embedding
         stmt = pg_insert(ProductEmbedding).values(
             product_id=product_id,
             embedding=embedding,
@@ -141,21 +156,121 @@ class EmbeddingRepo:
         )
         await self.db.execute(stmt)
 
+        # ── 2. Mirror into products (same transaction)
+        await self.db.execute(
+            update(Product)
+            .where(Product.id == product_id)
+            .values(
+                embedding_status="complete",
+                last_embedded_at=now,
+            )
+        )
+
+    # ═══════════════════════════════════════════════════════
+    # Writes — bulk
+    # ═══════════════════════════════════════════════════════
+    async def upsert_bulk(
+        self,
+        *,
+        rows: list[dict],
+        model: str,
+    ) -> int:
+        """
+        Bulk insert-or-update embeddings and mirror the state into
+        `products` in one transaction.
+
+        `rows` must be a list of dicts, each with:
+            product_id : UUID
+            embedding  : list[float]
+            source_text: str
+            source_hash: str
+
+        Returns the number of rows written.
+        """
+        if not rows:
+            return 0
+
+        now = datetime.now(timezone.utc)
+
+        # ── 1. Bulk upsert embeddings
+        values = [
+            {
+                "product_id": r["product_id"],
+                "model": model,
+                "embedding": r["embedding"],
+                "source_text": r["source_text"],
+                "source_hash": r["source_hash"],
+                "created_at": now,
+                "updated_at": now,
+            }
+            for r in rows
+        ]
+
+        stmt = pg_insert(ProductEmbedding).values(values)
+        stmt = stmt.on_conflict_do_update(
+            index_elements=["product_id", "model"],
+            set_={
+                "embedding": stmt.excluded.embedding,
+                "source_text": stmt.excluded.source_text,
+                "source_hash": stmt.excluded.source_hash,
+                "updated_at": now,
+            },
+        )
+        await self.db.execute(stmt)
+
+        # ── 2. Bulk update products
+        ids = [r["product_id"] for r in rows]
+        await self.db.execute(
+            update(Product)
+            .where(Product.id.in_(ids))
+            .values(
+                embedding_status="complete",
+                last_embedded_at=now,
+            )
+        )
+
+        return len(rows)
+
+    # ═══════════════════════════════════════════════════════
+    # Deletes — flip status back to 'pending'
+    # ═══════════════════════════════════════════════════════
     async def delete_for_product(self, product_id: UUID) -> int:
+        """
+        Delete all embeddings for a product and mark it 'pending'
+        in products. Same transaction — either both happen or
+        neither does.
+        """
         stmt = delete(ProductEmbedding).where(
             ProductEmbedding.product_id == product_id
         )
         result = await self.db.execute(stmt)
-        return result.rowcount or 0
+        deleted = result.rowcount or 0
+
+        if deleted > 0:
+            await self.db.execute(
+                update(Product)
+                .where(Product.id == product_id)
+                .values(
+                    embedding_status="pending",
+                    last_embedded_at=None,
+                )
+            )
+
+        return deleted
 
     async def invalidate(
         self, product_id: UUID, model: Optional[str] = None
     ) -> int:
         """
         Mark a product's embeddings as stale by deleting them.
-        The next backfill will re-embed.
+        The next backfill will re-embed and flip the status back
+        to 'complete'.
 
         If `model` is None, deletes all models for the product.
+        Only flips `products.embedding_status` when the last
+        model for this product was deleted — otherwise there
+        would still be an embedding present for a different
+        model.
         """
         stmt = delete(ProductEmbedding).where(
             ProductEmbedding.product_id == product_id
@@ -163,7 +278,29 @@ class EmbeddingRepo:
         if model:
             stmt = stmt.where(ProductEmbedding.model == model)
         result = await self.db.execute(stmt)
-        return result.rowcount or 0
+        deleted = result.rowcount or 0
+
+        if deleted == 0:
+            return 0
+
+        # Did we wipe ALL models for this product, or just one?
+        remaining = (await self.db.execute(
+            select(func.count())
+            .select_from(ProductEmbedding)
+            .where(ProductEmbedding.product_id == product_id)
+        )).scalar_one() or 0
+
+        if remaining == 0:
+            await self.db.execute(
+                update(Product)
+                .where(Product.id == product_id)
+                .values(
+                    embedding_status="pending",
+                    last_embedded_at=None,
+                )
+            )
+
+        return deleted
 
     # ═══════════════════════════════════════════════════════
     # Backfill helpers
@@ -215,7 +352,6 @@ class EmbeddingRepo:
     async def total_embedded(self, model: Optional[str] = None) -> int:
         """Count embeddings, optionally for a specific model."""
         return await self.count_ready(model)
-
 
     async def fetch_missing_batch(
     self,

@@ -1,8 +1,15 @@
+# app/api/v1/websocket.py
 """
-WebSocket endpoints — live monitoring progress.
+WebSocket endpoints.
 
-Reads state from Redis (populated by the monitoring engine).
-Falls back to DB when Redis has no live data.
+    /ws/progress          — monitoring progress (admin, live dashboard)
+    /ws/alerts            — global alert counters (admin dashboard)
+    /ws/user              — per-user notification push (auth via ?token=)
+
+Wire paths (with router mounted at /api/v1):
+    /api/v1/ws/progress
+    /api/v1/ws/alerts
+    /api/v1/ws/user
 """
 import asyncio
 import json
@@ -18,31 +25,21 @@ router = APIRouter()
 
 PROGRESS_KEY_PREFIX = "progress:site:"
 POLL_INTERVAL = 1.0
-
-# Hard cap per connection type to avoid abuse
 MAX_CONNECTIONS = 500
 
 
+# ═══════════════════════════════════════════════════════
+# Broadcasters
+# ═══════════════════════════════════════════════════════
 class ProgressBroadcaster:
-    """
-    Connection manager with hard limits and per-site subscription.
-    """
-
     def __init__(self, max_connections: int = MAX_CONNECTIONS):
         self.connections: Set[WebSocket] = set()
         self.max_connections = max_connections
         self._lock = asyncio.Lock()
 
     async def connect(self, ws: WebSocket) -> bool:
-        """
-        Accept and register a connection.
-        Returns False if the cap is reached (caller should reject).
-        """
         async with self._lock:
             if len(self.connections) >= self.max_connections:
-                logger.warning(
-                    "ws_connection_cap_reached", cap=self.max_connections
-                )
                 return False
             await ws.accept()
             self.connections.add(ws)
@@ -53,7 +50,6 @@ class ProgressBroadcaster:
             self.connections.discard(ws)
 
     async def broadcast(self, message: dict):
-        """Send to every connected client. Removes dead sockets."""
         if not self.connections:
             return
         payload = json.dumps(message, default=str)
@@ -71,11 +67,213 @@ class ProgressBroadcaster:
                     self.connections.discard(ws)
 
 
+class UserBroadcaster:
+    def __init__(self, max_users: int = 10_000, max_sockets: int = 50_000):
+        self._by_user: Dict[str, Set[WebSocket]] = {}
+        self._lock = asyncio.Lock()
+        self.max_users = max_users
+        self.max_sockets = max_sockets
+        self._socket_count = 0
+
+    async def connect(self, user_id: str, ws: WebSocket) -> bool:
+        async with self._lock:
+            if len(self._by_user) >= self.max_users and user_id not in self._by_user:
+                return False
+            if self._socket_count >= self.max_sockets:
+                return False
+            await ws.accept()
+            self._by_user.setdefault(user_id, set()).add(ws)
+            self._socket_count += 1
+            logger.info(
+                "ws_user_broadcaster_connect",
+                user_id=user_id,
+                total_users=len(self._by_user),
+                total_sockets=self._socket_count,
+            )
+            return True
+
+    async def disconnect(self, user_id: str, ws: WebSocket):
+        async with self._lock:
+            bucket = self._by_user.get(user_id)
+            if bucket is not None:
+                bucket.discard(ws)
+                self._socket_count = max(0, self._socket_count - 1)
+                if not bucket:
+                    self._by_user.pop(user_id, None)
+
+    async def push(self, user_id: str, message: dict) -> int:
+        async with self._lock:
+            bucket = self._by_user.get(user_id)
+            sockets = list(bucket) if bucket else []
+        if not sockets:
+            logger.info(
+                "ws_user_broadcaster_no_sockets",
+                user_id=user_id,
+                total_users=len(self._by_user),
+            )
+            return 0
+
+        payload = json.dumps(message, default=str)
+        sent = 0
+        dead: list[WebSocket] = []
+        for ws in sockets:
+            try:
+                await ws.send_text(payload)
+                sent += 1
+            except Exception:
+                dead.append(ws)
+
+        if dead:
+            async with self._lock:
+                bucket = self._by_user.get(user_id)
+                if bucket is not None:
+                    for ws in dead:
+                        bucket.discard(ws)
+                        self._socket_count = max(0, self._socket_count - 1)
+                    if not bucket:
+                        self._by_user.pop(user_id, None)
+
+        logger.info(
+            "ws_user_broadcaster_push",
+            user_id=user_id,
+            sockets_total=len(sockets),
+            sockets_sent=sent,
+        )
+        return sent
+
+
 broadcaster = ProgressBroadcaster()
+user_broadcaster = UserBroadcaster()
 
 
+# ═══════════════════════════════════════════════════════
+# Public push API — called by alert_fanout
+# ═══════════════════════════════════════════════════════
+async def push_alert_to_user(user_id: str, alert_id: int) -> int:
+    try:
+        from app.db import acquire_db
+        from sqlalchemy import text
+
+        async with acquire_db(readonly=True) as db:
+            row = (await db.execute(
+                text("""
+                    SELECT a.id, a.alert_type, a.old_value, a.new_value,
+                           a.change_percent, a.site,
+                           p.id::text AS product_id,
+                           p.name AS product_name,
+                           p.url AS product_url
+                    FROM monitoring_alerts a
+                    LEFT JOIN products p ON p.id = a.product_id
+                    WHERE a.id = :aid
+                """),
+                {"aid": alert_id},
+            )).first()
+
+        if row is None:
+            logger.warning(
+                "push_alert_to_user_missing_alert",
+                user_id=user_id, alert_id=alert_id,
+            )
+            return 0
+
+        payload = {
+            "type": "notification",
+            "kind": (
+                "price_alert" if row.alert_type == "price_drop"
+                else "stock_alert"
+            ),
+            "alert_id": int(row.id),
+            "title": _alert_title(row),
+            "body": _alert_body(row),
+            "product_id": row.product_id,
+            "product_name": (row.product_name or "")[:200],
+            "product_url": (row.product_url or "")[:500],
+            "old_price": _num(row.old_value),
+            "new_price": _num(row.new_value),
+            "discount_pct": row.change_percent,
+            "site": row.site,
+        }
+        return await user_broadcaster.push(user_id, payload)
+    except Exception as exc:
+        logger.warning(
+            "push_alert_to_user_failed",
+            user_id=user_id, alert_id=alert_id,
+            error=str(exc)[:200],
+        )
+        return 0
+
+
+async def push_unread_count(user_id: str) -> int:
+    try:
+        from app.db import acquire_db
+        from sqlalchemy import text
+
+        async with acquire_db(readonly=True) as db:
+            n = (await db.execute(
+                text(
+                    "SELECT COUNT(*) FROM notifications "
+                    "WHERE user_id = :uid AND is_read = FALSE"
+                ),
+                {"uid": user_id},
+            )).scalar_one()
+
+        return await user_broadcaster.push(
+            user_id,
+            {"type": "unread_count", "count": int(n)},
+        )
+    except Exception as exc:
+        logger.debug(
+            "push_unread_count_failed",
+            user_id=user_id, error=str(exc)[:200],
+        )
+        return 0
+
+
+def _alert_title(a) -> str:
+    name = (a.product_name or "Product")[:80]
+    if a.alert_type == "price_drop":
+        return f"Price drop: {name}"
+    if a.alert_type == "back_in_stock":
+        return f"Back in stock: {name}"
+    return f"Update: {name}"
+
+
+def _alert_body(a) -> str:
+    if a.alert_type == "price_drop":
+        try:
+            pct = float(a.change_percent or 0.0)
+            return f"{a.old_value} → {a.new_value} ({pct:+.1f}%) on {a.site}"
+        except Exception:
+            return f"{a.old_value} → {a.new_value} on {a.site}"
+    if a.alert_type == "back_in_stock":
+        return f"Available again on {a.site}"
+    return f"{a.old_value} → {a.new_value} on {a.site}"
+
+
+def _num(v) -> Optional[float]:
+    try:
+        return float(v) if v not in (None, "") else None
+    except Exception:
+        return None
+
+
+def _verify_ws_token(token: Optional[str]) -> Optional[str]:
+    if not token:
+        return None
+    try:
+        from app.core.security import decode_token
+        payload = decode_token(token, expected_type="access")
+        uid = payload.get("sub")
+        return str(uid) if uid else None
+    except Exception as exc:
+        logger.warning("ws_token_invalid", error=str(exc)[:100])
+        return None
+
+
+# ═══════════════════════════════════════════════════════
+# Endpoints
+# ═══════════════════════════════════════════════════════
 async def _read_progress(redis: Redis, site: Optional[str]) -> dict:
-    """Read monitoring progress from Redis. Empty if nothing found."""
     result: dict = {}
     try:
         if site:
@@ -119,13 +317,6 @@ async def ws_progress(
     site: Optional[str] = Query(None, max_length=50),
     token: Optional[str] = Query(None),
 ):
-    """
-    Stream monitoring progress.
-
-    Usage:
-        ws://host/api/v1/ws/progress?site=megapc
-        ws://host/api/v1/ws/progress (all sites)
-    """
     if not await broadcaster.connect(websocket):
         await websocket.close(code=1013, reason="Server busy")
         return
@@ -144,7 +335,7 @@ async def ws_progress(
                 await websocket.send_json({"type": "progress", "sites": {}})
             await asyncio.sleep(POLL_INTERVAL)
     except WebSocketDisconnect:
-        logger.debug("ws_progress_disconnected", site=site)
+        pass
     except Exception as e:
         logger.warning("ws_progress_error", error=str(e), site=site)
     finally:
@@ -152,11 +343,15 @@ async def ws_progress(
 
 
 @router.websocket("/ws/alerts")
-async def ws_alerts(websocket: WebSocket):
-    """
-    Stream alerts count for live badges.
-    Reads lightweight counters from Redis.
-    """
+async def ws_alerts(
+    websocket: WebSocket,
+    token: Optional[str] = Query(None),
+):
+    user_id = _verify_ws_token(token)
+    if user_id is None:
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
     if not await broadcaster.connect(websocket):
         await websocket.close(code=1013, reason="Server busy")
         return
@@ -183,3 +378,62 @@ async def ws_alerts(websocket: WebSocket):
         logger.warning("ws_alerts_error", error=str(e))
     finally:
         await broadcaster.disconnect(websocket)
+
+
+@router.websocket("/ws/user")
+async def ws_user(
+    websocket: WebSocket,
+    token: Optional[str] = Query(None),
+):
+    user_id = _verify_ws_token(token)
+    if user_id is None:
+        logger.warning("ws_user_rejected_unauthorized")
+        await websocket.close(code=4401, reason="Unauthorized")
+        return
+
+    if not await user_broadcaster.connect(user_id, websocket):
+        await websocket.close(code=1013, reason="Server busy")
+        return
+
+    logger.info("ws_user_connected", user_id=user_id)
+
+    try:
+        await websocket.send_json({"type": "hello", "user_id": user_id})
+        try:
+            from app.db import acquire_db
+            from sqlalchemy import text
+            async with acquire_db(readonly=True) as db:
+                n = (await db.execute(
+                    text(
+                        "SELECT COUNT(*) FROM notifications "
+                        "WHERE user_id = :uid AND is_read = FALSE"
+                    ),
+                    {"uid": user_id},
+                )).scalar_one()
+            await websocket.send_json(
+                {"type": "unread_count", "count": int(n)}
+            )
+        except Exception as exc:
+            logger.debug(
+                "ws_user_unread_initial_failed",
+                user_id=user_id, error=str(exc)[:200],
+            )
+
+        while True:
+            try:
+                msg = await asyncio.wait_for(
+                    websocket.receive_text(), timeout=30.0
+                )
+                if msg == "ping":
+                    await websocket.send_text('{"type":"pong"}')
+            except asyncio.TimeoutError:
+                await websocket.send_json({"type": "ping"})
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.warning(
+            "ws_user_error", user_id=user_id, error=str(e)[:200]
+        )
+    finally:
+        await user_broadcaster.disconnect(user_id, websocket)
+        logger.info("ws_user_closed", user_id=user_id)

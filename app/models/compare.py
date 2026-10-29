@@ -65,22 +65,6 @@ class BaseGroupDetail(BaseModel):
     variants: list[VariantInBase]
 
 
-# ── Base-level cheapest (Gap 5 from the audit) ─────────────
-class CheapestResult(BaseModel):
-    base_group_id: UUID
-    base_name: str
-    variant_count: int
-    site_count: int
-    cheapest_site: str
-    cheapest_price: float
-
-
-class CheapestResponse(BaseModel):
-    query: str
-    count: int
-    results: list[CheapestResult]
-
-
 class GroupHistoryPoint(BaseModel):
     date: str
     site: str

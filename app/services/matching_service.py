@@ -1,22 +1,23 @@
 """Cross-site product matching service.
 
-Pipeline:
-    1. Candidate pairs via pgvector (cross-site only)
-    2. Deterministic matching rules
-    3. LLM verification for genuinely borderline pairs (budgeted)
-    4. Constrained Union-Find → exact variant clusters
-    5. Persist variant clusters to canonical_products
-    6. Link accepted pairs to their canonical
-    7. Deterministic base grouping by base_signature
-    8. Price rollup (delegated to CanonicalRepo)
-    9. Denormalize embeddings
-   10. Integrity validation
+Two entry points:
+
+  run_full_match        — the initial/periodic full matching pass.
+                          Candidate pairs via pgvector, deterministic
+                          rules, LLM for borderline, Union-Find
+                          clustering, base grouping, price rollup.
+
+  run_targeted_match    — the verification loop's rebuild path.
+                          Delegates to CanonicalRebuilder, which uses
+                          the SAME deterministic identity_signature_hash
+                          logic as scripts/backfill_canonical_products.py.
+                          No pairwise matching, no LLM — those decisions
+                          were already made during initial ingestion.
 """
 from __future__ import annotations
 
 import asyncio
 import random
-import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
@@ -45,6 +46,10 @@ from app.core.variant_signature import (
 from app.models.product import Product
 from app.repositories.canonical_repo import CanonicalRepo
 from app.repositories.match_repo import MatchRepo
+from app.services.matching_helpers import (
+    recompute_base_cheapest,
+    recompute_canonical_cheapest,
+)
 
 logger = get_logger(__name__)
 
@@ -111,7 +116,7 @@ class MatchingStats:
     llm_accepted: int = 0
     llm_rejected: int = 0
     llm_errors: int = 0
-    llm_deferred: int = 0           # budget exhausted (Gap 4)
+    llm_deferred: int = 0
     cluster_rejected: int = 0
     variant_groups_created: int = 0
     products_grouped: int = 0
@@ -136,7 +141,6 @@ class MatchingStats:
         out = {k: getattr(self, k) for k in self._FIXED_KEYS}
         for k, v in self.details.items():
             if k in out:
-                # Defensive: refuse to silently shadow a counter (Gap 16).
                 raise ValueError(f"details key collides with counter: {k}")
             out[k] = v
         return out
@@ -147,17 +151,16 @@ class MatchingStats:
 # ═══════════════════════════════════════════════════════
 class MatchingService:
     def __init__(
-        self, db: AsyncSession, *, model: Optional[str] = None
+        self, db: AsyncSession, *, model: Optional[str] = None,
     ) -> None:
         self.db = db
         self.canon_repo = CanonicalRepo(db)
         self.match_repo = MatchRepo(db)
         self.model = model or settings.active_embedding_model
-        # LLM concurrency guard (Gap 3).
         self._llm_sem = asyncio.Semaphore(VARIANT.LLM_MAX_CONCURRENCY)
 
     # ═══════════════════════════════════════════════════════
-    # Entry point
+    # Entry point — full match
     # ═══════════════════════════════════════════════════════
     async def run_full_match(
         self,
@@ -168,13 +171,13 @@ class MatchingService:
         clear_existing: bool = True,
     ) -> MatchingStats:
         stats = MatchingStats()
-        logger.info("matching_started", model=self.model,
-                    llm_budget=llm_budget)
+        logger.info(
+            "matching_started", model=self.model, llm_budget=llm_budget,
+        )
 
         if clear_existing:
             await self.canon_repo.clear_all()
 
-        # ── 1. Candidates
         candidates = await self.match_repo.find_candidate_pairs(
             model=self.model, max_distance=max_distance,
         )
@@ -183,31 +186,108 @@ class MatchingService:
         stats.candidates_found = len(candidates)
 
         if not candidates:
-            await self.canon_repo.recompute_prices()
+            await recompute_canonical_cheapest(self.db)
+            await recompute_base_cheapest(self.db)
             await self.canon_repo.sync_embedding_canonical_ids()
             await self.db.commit()
             return stats
 
-        # ── 2. Load products + signatures + embeddings
+        return await self._execute_pipeline(
+            candidates=candidates,
+            llm_budget=llm_budget,
+            stats=stats,
+        )
+
+    # ═══════════════════════════════════════════════════════
+    # Entry point — targeted match (deterministic rebuild)
+    # ═══════════════════════════════════════════════════════
+    async def run_targeted_match(
+        self,
+        *,
+        product_ids: list[UUID],
+        max_distance: float = VARIANT.LLM_VERIFY_MAX_DISTANCE,
+        llm_budget: Optional[int] = None,
+        task_id: Optional[str] = None,
+    ) -> MatchingStats:
+        """
+        Rebuild canonicals + bases for a subset of products using
+        the SAME deterministic identity_signature_hash logic as the
+        initial backfill. No pairwise matching, no LLM.
+
+        max_distance and llm_budget are kept in the signature for
+        backwards compatibility but are unused.
+        """
+        from app.services.canonical_rebuilder import (
+            CanonicalRebuilder,
+        )
+
+        stats = MatchingStats()
+        logger.info(
+            "targeted_rebuild_started",
+            product_count=len(product_ids),
+            mode="deterministic_rebuild",
+            task_id=task_id,
+        )
+
+        if not product_ids:
+            return stats
+
+        await self._ensure_embeddings(product_ids)
+
+        rebuilder = CanonicalRebuilder(self.db)
+        rebuild_stats = await rebuilder.rebuild_for_products(
+            product_ids,
+            task_id=task_id,
+        )
+
+        stats.candidates_found = rebuild_stats["products"]
+        stats.variant_groups_created = (
+            rebuild_stats["canonicals_created"]
+        )
+        stats.products_grouped = (
+            rebuild_stats["canonicals_created"]
+            + rebuild_stats["canonicals_updated"]
+        )
+        stats.base_groups_created = rebuild_stats["bases_created"]
+        stats.base_groups_updated = rebuild_stats["bases_updated"]
+        stats.errors = 0
+
+        logger.info(
+            "targeted_rebuild_complete",
+            **rebuild_stats,
+        )
+        return stats
+
+    # ═══════════════════════════════════════════════════════
+    # Shared pipeline (used by run_full_match only)
+    # ═══════════════════════════════════════════════════════
+    async def _execute_pipeline(
+        self,
+        *,
+        candidates: list[dict],
+        llm_budget: Optional[int],
+        stats: MatchingStats,
+        targeted: bool = False,
+    ) -> MatchingStats:
+        # ── 1. Corpus weights
         from app.services.corpus_stats import compute_token_frequencies
         corpus_weights = await compute_token_frequencies(self.db)
 
+        # ── 2. Load products + signatures + embeddings
         all_pids: set[UUID] = set()
         for c in candidates:
             all_pids.add(c["product_a_id"])
             all_pids.add(c["product_b_id"])
 
-        rows = (
-            await self.db.execute(
-                select(Product).where(Product.id.in_(all_pids))
-            )
-        ).scalars().all()
+        rows = (await self.db.execute(
+            select(Product).where(Product.id.in_(all_pids))
+        )).scalars().all()
         product_map: dict[UUID, Product] = {p.id: p for p in rows}
         signatures = {
             pid: extract_variant_signature(p)
             for pid, p in product_map.items()
         }
-        embedding_map = await self._load_embeddings(list(all_pids))
+        await self._load_embeddings(list(all_pids))
 
         from app.services.matching_rules import compare_products
 
@@ -227,7 +307,6 @@ class MatchingService:
                 a=pa, b=pb, corpus_token_weights=corpus_weights,
             )
 
-            # ── Reject
             if decision.decision == "reject":
                 if not decision.variant_match:
                     stats.variant_rejected += 1
@@ -243,7 +322,6 @@ class MatchingService:
                 )
                 continue
 
-            # ── Accept (rules)
             if decision.decision == "accept":
                 stats.auto_accepted += 1
                 accepted_edges.append((pid_a, pid_b, decision.confidence))
@@ -258,9 +336,8 @@ class MatchingService:
                 )
                 continue
 
-            # ── Borderline → LLM (budgeted, flag-respecting)
+            # Borderline -> LLM
             if not settings.matching_llm_enabled:
-                # Gap 1: kill-switch. Borderline collapses to reject.
                 stats.llm_deferred += 1
                 await self.match_repo.upsert_pair(
                     product_a_id=pid_a, product_b_id=pid_b, group_id=None,
@@ -273,15 +350,15 @@ class MatchingService:
                 continue
 
             if llm_budget is not None and llm_calls_made >= llm_budget:
-                # Gap 4: budget exhausted. Defer to next run.
                 stats.llm_deferred += 1
                 await self.match_repo.upsert_pair(
                     product_a_id=pid_a, product_b_id=pid_b, group_id=None,
-                    cosine_distance=dist, decision="borderline_deferred",
+                    cosine_distance=dist,
+                    decision="borderline_deferred",
                     decision_source="budget",
                     variant_match=True,
                     token_overlap=decision.token_overlap,
-                    llm_reason="LLM budget exhausted; deferred to next run.",
+                    llm_reason="LLM budget exhausted; deferred.",
                 )
                 continue
 
@@ -413,7 +490,7 @@ class MatchingService:
             stats.variant_groups_created += 1
             stats.products_grouped += len(members)
 
-        # ── 6. Link accepted pairs to their canonical (Gap 5)
+        # ── 6. Link accepted pairs to their canonical
         for a, b, _ in accepted_edges:
             gid = product_to_variant_group.get(a)
             if gid is None or product_to_variant_group.get(b) != gid:
@@ -423,23 +500,37 @@ class MatchingService:
                 await self.match_repo.link_pair_to_group(pair.id, gid)
                 stats.pairs_linked += 1
 
-        # ── 7. Deterministic base grouping (Gap 13)
+        # ── 7. Base grouping
         await self._build_base_groups_deterministic(
             variant_group_ids=variant_group_ids,
             stats=stats,
         )
 
-        # ── 8. Price rollup (Gap 14)
-        await self.canon_repo.recompute_prices()
-        await self.canon_repo.sync_embedding_canonical_ids()
+        # ── 8. Price rollup
+        if targeted:
+            await recompute_canonical_cheapest(
+                self.db, canonical_ids=variant_group_ids,
+            )
+            await recompute_base_cheapest(self.db)
+            await self._recompute_counters_for_canonicals(
+                variant_group_ids,
+            )
+        else:
+            await recompute_canonical_cheapest(self.db)
+            await recompute_base_cheapest(self.db)
 
+        await self.canon_repo.sync_embedding_canonical_ids()
         await self.db.commit()
 
-        # ── 9. Integrity check AFTER commit (Gap 6)
+        # ── 9. Integrity check
         stats.integrity_errors = await self._validate_integrity()
         stats.errors += stats.integrity_errors
 
-        logger.info("matching_complete", **stats.as_dict())
+        logger.info(
+            "matching_complete",
+            targeted=targeted,
+            **stats.as_dict(),
+        )
         return stats
 
     # ═══════════════════════════════════════════════════════
@@ -472,7 +563,7 @@ class MatchingService:
 
     @staticmethod
     def _group_is_valid(
-        products: list[Product], signatures: dict[UUID, dict]
+        products: list[Product], signatures: dict[UUID, dict],
     ) -> bool:
         seen_sites: set[str] = set()
         for p in products:
@@ -504,7 +595,7 @@ class MatchingService:
         return result
 
     # ═══════════════════════════════════════════════════════
-    # Base grouping — deterministic by signature (Gap 13)
+    # Base grouping
     # ═══════════════════════════════════════════════════════
     async def _build_base_groups_deterministic(
         self,
@@ -515,10 +606,12 @@ class MatchingService:
         if not variant_group_ids:
             return
 
+        from app.models.canonical_product import CanonicalProduct
+
         variants = (
             await self.db.execute(
-                select(self._canonical_model()).where(
-                    self._canonical_model().id.in_(variant_group_ids)
+                select(CanonicalProduct).where(
+                    CanonicalProduct.id.in_(variant_group_ids)
                 )
             )
         ).scalars().all()
@@ -539,14 +632,10 @@ class MatchingService:
             ).strip(" /-|,") or "Unknown"
 
             variant_ids = [c.id for c in children]
-
-            # Aggregate sites + listings across all children.
-            # We already have listing_count on each child.
             child_listings = sum(
                 (c.listing_count or 0) for c in children
             )
 
-            # Site count: union across the listings of all children.
             site_rows = await self.db.execute(
                 text(
                     "SELECT DISTINCT site FROM products "
@@ -582,20 +671,50 @@ class MatchingService:
             else:
                 stats.base_groups_created += 1
 
-    @staticmethod
-    def _canonical_model():
-        from app.models.canonical_product import CanonicalProduct
-        return CanonicalProduct
-
     # ═══════════════════════════════════════════════════════
     # Embeddings
     # ═══════════════════════════════════════════════════════
+    async def _ensure_embeddings(
+        self, product_ids: list[UUID],
+    ) -> int:
+        if not product_ids:
+            return 0
+
+        existing = set((await self.db.execute(
+            text(
+                "SELECT product_id FROM product_embeddings "
+                "WHERE product_id = ANY(CAST(:ids AS uuid[])) "
+                "AND model = :model"
+            ),
+            {
+                "ids": [str(x) for x in product_ids],
+                "model": self.model,
+            },
+        )).scalars().all())
+
+        missing = [pid for pid in product_ids if pid not in existing]
+        if not missing:
+            return 0
+
+        logger.info(
+            "targeted_match_embedding_backfill",
+            missing=len(missing),
+            model=self.model,
+        )
+
+        from app.services.embedding_service import EmbeddingService
+        service = EmbeddingService(db=self.db)
+        written = await service.embed_products_bulk(missing)
+        await self.db.commit()
+        return written
+
     async def _load_embeddings(
-        self, product_ids: list[UUID]
+        self, product_ids: list[UUID],
     ) -> dict[UUID, list[float]]:
         if not product_ids:
             return {}
         from app.models.product_embedding import ProductEmbedding
+
         stmt = select(
             ProductEmbedding.product_id, ProductEmbedding.embedding,
         ).where(
@@ -622,7 +741,7 @@ class MatchingService:
         return out
 
     # ═══════════════════════════════════════════════════════
-    # LLM verification (Gaps 2, 7)
+    # LLM verification (for full match only)
     # ═══════════════════════════════════════════════════════
     async def _llm_verify(
         self,
@@ -652,9 +771,9 @@ class MatchingService:
             "price comparison system. Decide whether two listings "
             "represent the same physical product/variant. "
             "Do not infer equivalence when a model, storage, RAM, GPU, "
-            "cable length, wattage, speed, or other explicit "
-            "specification conflicts. Colour and marketing wording alone "
-            "do not make two otherwise identical products different. "
+            "cable length, wattage, speed, colour, or other explicit "
+            "specification conflicts. Marketing wording alone does not "
+            "make two otherwise identical products different. "
             "When evidence is insufficient, return false. "
             "Reply with JSON only: "
             '{"same_product": bool, "confidence": 0-1, "reason": "..."}'
@@ -703,17 +822,101 @@ class MatchingService:
         return None
 
     # ═══════════════════════════════════════════════════════
-    # Integrity (Gap 6)
+    # Targeted price recompute
+    # ═══════════════════════════════════════════════════════
+    async def _recompute_affected_prices(
+        self, product_ids: list[UUID],
+    ) -> None:
+        if not product_ids:
+            return
+        rows = (await self.db.execute(
+            text(
+                "SELECT DISTINCT canonical_id FROM products "
+                "WHERE id = ANY(CAST(:ids AS uuid[])) "
+                "AND canonical_id IS NOT NULL"
+            ),
+            {"ids": [str(x) for x in product_ids]},
+        )).all()
+        canonical_ids = [r.canonical_id for r in rows]
+        if canonical_ids:
+            await recompute_canonical_cheapest(
+                self.db, canonical_ids=canonical_ids,
+            )
+            await recompute_base_cheapest(self.db)
+
+    # ═══════════════════════════════════════════════════════
+    # Counter recompute for targeted runs
+    # ═══════════════════════════════════════════════════════
+    async def _recompute_counters_for_canonicals(
+        self, canonical_ids: list[UUID],
+    ) -> None:
+        """
+        Recompute listing_count, site_count on canonical_products
+        and variant_count on the parent base_groups for the given
+        canonical IDs. Keeps integrity checks green after a
+        targeted rebuild.
+        """
+        if not canonical_ids:
+            return
+
+        await self.db.execute(
+            text("""
+                UPDATE canonical_products cp
+                SET listing_count = sub.listing_count,
+                    site_count = sub.site_count
+                FROM (
+                    SELECT
+                        p.canonical_id,
+                        COUNT(*) AS listing_count,
+                        COUNT(DISTINCT p.site) AS site_count
+                    FROM products p
+                    WHERE p.canonical_id = ANY(CAST(:ids AS uuid[]))
+                    GROUP BY p.canonical_id
+                ) sub
+                WHERE cp.id = sub.canonical_id
+            """),
+            {"ids": [str(x) for x in canonical_ids]},
+        )
+
+        base_ids = (await self.db.execute(
+            text("""
+                SELECT DISTINCT base_group_id
+                FROM canonical_products
+                WHERE id = ANY(CAST(:ids AS uuid[]))
+                  AND base_group_id IS NOT NULL
+            """),
+            {"ids": [str(x) for x in canonical_ids]},
+        )).scalars().all()
+
+        if base_ids:
+            await self.db.execute(
+                text("""
+                    UPDATE base_groups bg
+                    SET variant_count = sub.variant_count
+                    FROM (
+                        SELECT
+                            cp.base_group_id,
+                            COUNT(*) AS variant_count
+                        FROM canonical_products cp
+                        WHERE cp.base_group_id = ANY(CAST(:bids AS uuid[]))
+                        GROUP BY cp.base_group_id
+                    ) sub
+                    WHERE bg.id = sub.base_group_id
+                """),
+                {"bids": [str(x) for x in base_ids]},
+            )
+
+    # ═══════════════════════════════════════════════════════
+    # Integrity check
     # ═══════════════════════════════════════════════════════
     async def _validate_integrity(self) -> int:
         errors = 0
-        # 1. Every variant with listings has a base
         v = await self.db.execute(text(
             "SELECT COUNT(*) FROM canonical_products "
             "WHERE base_group_id IS NULL AND listing_count > 0"
         ))
         errors += int(v.scalar_one())
-        # 2. listing_count matches reality
+
         v = await self.db.execute(text(
             "SELECT COUNT(*) FROM canonical_products cp "
             "WHERE cp.listing_count <> ("
@@ -722,7 +925,7 @@ class MatchingService:
             ")"
         ))
         errors += int(v.scalar_one())
-        # 3. variant_count matches reality
+
         v = await self.db.execute(text(
             "SELECT COUNT(*) FROM base_groups bg "
             "WHERE bg.variant_count <> ("
@@ -735,7 +938,7 @@ class MatchingService:
 
 
 # ═══════════════════════════════════════════════════════
-# Helpers
+# Module helpers
 # ═══════════════════════════════════════════════════════
 def normalize_site(value: Optional[str]) -> str:
     return " ".join((value or "").strip().lower().split())
@@ -747,7 +950,7 @@ def normalize_text(value: Optional[str]) -> str:
 
 
 def _most_common(
-    values: list[Optional[str]], default: Optional[str]
+    values: list[Optional[str]], default: Optional[str],
 ) -> Optional[str]:
     cleaned = [str(v) for v in values if v]
     if not cleaned:

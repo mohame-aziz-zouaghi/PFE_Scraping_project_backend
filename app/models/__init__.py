@@ -15,6 +15,9 @@ from app.models.product_embedding import ProductEmbedding
 from app.models.product_match import ProductMatchPair 
 from app.models.canonical_product import CanonicalProduct  # noqa
 from app.models.base_group import BaseGroup  # noqa
+from app.models.help_article import HelpArticle
+from app.models.help_embedding import HelpEmbedding
+from app.models.canonical_embedding import CanonicalEmbedding
 
 
 __all__ = [
@@ -33,5 +36,9 @@ __all__ = [
     "ProductMatchPair",
     "CanonicalProduct",
     "BaseGroup",
+    "CanonicalEmbedding",
+    "HelpEmbedding",
+    "HelpArticle",
+
 
 ]

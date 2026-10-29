@@ -1,58 +1,110 @@
+# app/core/embeddings.py
 """
-Optional embedding provider.
+Thin shim so RAG code can `from app.core.embeddings import embed_text`.
 
-Semantic search only activates when:
-1. This module defines a working `embed_text()`
-2. `SEMANTIC_ENABLED` is True
-3. `products.embedding` is populated
+The real implementation lives in
+`app.services.embedding_service.EmbeddingService`. This module
+exists because a lot of existing code imports from
+`app.core.embeddings` — we don't want to change every caller, and
+we don't want two implementations of the same function drifting
+apart.
 
-Until then, search falls back to text search.
+Previous state: this module contained a stub with
+`SEMANTIC_ENABLED = False` that always returned None. That stub
+is now removed. The real service is always called.
+
+To keep the debug visibility (the RAG pipeline treats a None
+return as "embedding unavailable"), set EMBEDDING_DEBUG=1 in the
+environment to raise on failure instead.
 """
+from __future__ import annotations
+
+import os
 from typing import Optional
+from uuid import UUID
 
 from app.core.logging_config import get_logger
+from app.services.embedding_service import (
+    EmbeddingError,
+    EmbeddingService,
+)
 
 logger = get_logger(__name__)
 
-
-# Set to True once you have a real embedding provider wired up
-SEMANTIC_ENABLED = False
-
-# Dimension must match the DB column: products.embedding vector(768)
-EMBEDDING_DIM = 768
+_DEBUG = os.environ.get("EMBEDDING_DEBUG", "0") == "1"
 
 
-async def embed_text(text: str) -> Optional[list[float]]:
+async def embed_text(
+    text: str,
+    *,
+    db=None,
+    user_id: Optional[UUID] = None,
+    endpoint: str = "rag",
+) -> Optional[list[float]]:
     """
-    Convert text to a float vector.
+    Embed a single string via the real embedding service.
 
-    Default: returns None (semantic search disabled → falls back to text search).
-
-    To enable, implement using your provider:
-
-        from openai import AsyncOpenAI
-        client = AsyncOpenAI(api_key=settings.openai_api_key)
-        resp = await client.embeddings.create(
-            model="text-embedding-3-small",
-            input=text,
-        )
-        return resp.data[0].embedding
-
-    Then set SEMANTIC_ENABLED = True above.
+    Returns None on failure — which is what the RAG pipeline
+    expects (a None return triggers the "assistant unavailable"
+    refusal). Set EMBEDDING_DEBUG=1 to raise instead, so the
+    real exception surfaces.
     """
-    if not SEMANTIC_ENABLED:
+    if not text or not text.strip():
         return None
 
-    logger.warning("embed_text_called_but_not_implemented")
-    return None
+    try:
+        svc = EmbeddingService(
+            db=db, user_id=user_id, endpoint=endpoint
+        )
+        return await svc.embed_one(text)
+    except EmbeddingError as exc:
+        logger.warning(
+            "embed_text_failed", error=str(exc)[:200]
+        )
+        if _DEBUG:
+            raise
+        return None
+    except Exception as exc:
+        logger.exception(
+            "embed_text_unhandled", error=str(exc)[:200]
+        )
+        if _DEBUG:
+            raise
+        return None
 
 
-async def embed_batch(texts: list[str]) -> list[Optional[list[float]]]:
-    """Batch version — useful for backfilling embeddings."""
-    if not SEMANTIC_ENABLED:
-        return [None] * len(texts)
+async def embed_batch(
+    texts: list[str],
+    *,
+    db=None,
+    user_id: Optional[UUID] = None,
+    endpoint: str = "rag",
+) -> list[list[float]]:
+    """
+    Embed a batch. Matches the old stub's signature so nothing
+    that imported `embed_batch` breaks.
 
-    results: list[Optional[list[float]]] = []
-    for t in texts:
-        results.append(await embed_text(t))
-    return results
+    Returns a list of vectors (one per input). Skips any input
+    that fails — the caller can detect this by length.
+    """
+    if not texts:
+        return []
+    try:
+        svc = EmbeddingService(
+            db=db, user_id=user_id, endpoint=endpoint
+        )
+        return await svc.embed_batch(texts)
+    except EmbeddingError as exc:
+        logger.warning(
+            "embed_batch_failed", error=str(exc)[:200]
+        )
+        if _DEBUG:
+            raise
+        return []
+    except Exception as exc:
+        logger.exception(
+            "embed_batch_unhandled", error=str(exc)[:200]
+        )
+        if _DEBUG:
+            raise
+        return []

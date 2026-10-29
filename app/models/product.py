@@ -148,6 +148,18 @@ class Product(Base):
         DateTime(timezone=True), nullable=True
     )
 
+        # ── Embedding tracking (added for the RAG pipeline) ──
+    embedding_status: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="pending",
+        server_default="pending",
+    )
+    last_embedded_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
     canonical_id: Mapped[Optional[UUID]] = mapped_column(
         PG_UUID(as_uuid=True),
         ForeignKey("canonical_products.id", ondelete="SET NULL"),
